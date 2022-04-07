@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2021, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
+ * Copyright (c) 2022, WSO2 Inc. (http://www.wso2.com) All Rights Reserved.
  *
  * WSO2 Inc. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -15,22 +15,34 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { AsgardeoAuthClient, AuthClientConfig, CryptoUtils, Store } from "@asgardeo/auth-js";
-import { AsgardeoAuthException } from "../exception";
-import { AuthURLCallback, NodeTokenResponse } from "../models";
-import { UserSession } from "../session";
+
+import {
+    AsgardeoAuthClient,
+    AsgardeoAuthException,
+    AuthClientConfig,
+    BasicUserInfo,
+    CryptoUtils,
+    CustomGrantConfig,
+    DecodedIDTokenPayload,
+    FetchResponse,
+    OIDCEndpoints,
+    SessionData,
+    Store,
+    TokenResponse
+} from "@asgardeo/auth-js";
+import { DataLayer } from "@asgardeo/auth-js/dist/src/data";
+import { AuthURLCallback } from "../models";
 import { MemoryCacheStore } from "../stores";
+import { Logger, SessionUtils } from "../utils";
 import { NodeCryptoUtils } from "../utils/crypto-utils";
 
-export class AsgardeoNodeCore<T>{
-
+export class AsgardeoNodeCore<T> {
     private _auth: AsgardeoAuthClient<T>;
     private _cryptoUtils: CryptoUtils;
     private _store: Store;
-    private _sessionStore: UserSession;
+    private _dataLayer: DataLayer<T>;
 
     constructor(config: AuthClientConfig<T>, store?: Store) {
-
         //Initialize the default memory cache store if an external store is not passed.
         if (!store) {
             this._store = new MemoryCacheStore();
@@ -39,180 +51,209 @@ export class AsgardeoNodeCore<T>{
         }
         this._cryptoUtils = new NodeCryptoUtils();
         this._auth = new AsgardeoAuthClient(this._store, this._cryptoUtils);
-        this._sessionStore = new UserSession(this._store);
         this._auth.initialize(config);
+        this._dataLayer = this._auth.getDataLayer();
+        Logger.debug("Initialized AsgardeoAuthClient successfully");
     }
 
-    public async signIn(authURLCallback: AuthURLCallback, authorizationCode?: string, sessionState?: string)
-        : Promise<NodeTokenResponse> {
+    public async signIn(
+        authURLCallback: AuthURLCallback,
+        userID: string,
+        authorizationCode?: string,
+        sessionState?: string,
+        state?: string,
+        signInConfig?: Record<string, string | boolean>
+    ): Promise<TokenResponse> {
+        if (!userID) {
+            return Promise.reject(
+                new AsgardeoAuthException(
+                    "NODE-AUTH_CORE-SI-NF01",
+                    "No user ID was provided.",
+                    "Unable to sign in the user as no user ID was provided."
+                )
+            );
+        }
+
+        if (await this.isAuthenticated(userID)) {
+            const sessionData: SessionData = await this._dataLayer.getSessionData(userID);
+
+            return Promise.resolve({
+                accessToken: sessionData.access_token,
+                createdAt: sessionData.created_at,
+                expiresIn: sessionData.expires_in,
+                idToken: sessionData.id_token,
+                refreshToken: sessionData.refresh_token ?? "",
+                scope: sessionData.scope,
+                tokenType: sessionData.token_type
+            });
+        }
 
         //Check if the authorization code or session state is there.
         //If so, generate the access token, otherwise generate the auth URL and return with callback function.
-
-        if (!authorizationCode || !sessionState) {
-            const authURL = await this.getAuthURL();
+        if (!authorizationCode || !state) {
+            if (!authURLCallback || typeof authURLCallback !== "function") {
+                return Promise.reject(
+                    new AsgardeoAuthException(
+                        "NODE-AUTH_CORE-SI-NF02",
+                        "Invalid AuthURLCallback function.",
+                        "The AuthURLCallback is not defined or is not a function."
+                    )
+                );
+            }
+            const authURL = await this.getAuthURL(userID, signInConfig);
             authURLCallback(authURL);
+
             return Promise.resolve({
                 accessToken: "",
+                createdAt: 0,
                 expiresIn: "",
                 idToken: "",
                 refreshToken: "",
                 scope: "",
                 session: "",
                 tokenType: ""
-            })
-        } else {
-            const tokenResponse = await this.requestAccessToken(authorizationCode, sessionState);
-            if (tokenResponse) {
-                return Promise.resolve(tokenResponse);
-            }
+            });
         }
 
-        return Promise.reject(
-            new AsgardeoAuthException(
-                "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                "node-authentication",
-                "signIn",
-                "Access token or decoded token failed.",
-                "No token endpoint was found in the OIDC provider meta data returned by the well-known endpoint " +
-                "or the token endpoint passed to the SDK is empty."
-            )
-        );
+        return this.requestAccessToken(authorizationCode, sessionState ?? "", userID, state);
     }
 
-    public async getAuthURL(): Promise<string> {
-
-        const authURL = await this._auth.getAuthorizationURL();
+    public async getAuthURL(userId: string, signInConfig?: Record<string, string | boolean>): Promise<string> {
+        const authURL = await this._auth.getAuthorizationURL(signInConfig, userId);
 
         if (authURL) {
-            return Promise.resolve(authURL.toString())
+            return Promise.resolve(authURL.toString());
         } else {
             return Promise.reject(
                 new AsgardeoAuthException(
-                    "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                    "node-authentication",
-                    "getAuthURL",
-                    "Access token or decoded token failed.",
-                    "No token endpoint was found in the OIDC provider meta data returned by the well-known endpoint " +
-                    "or the token endpoint passed to the SDK is empty."
-                )
-            )
-        }
-    }
-
-    public async requestAccessToken(authorizationCode: string, sessionState: string): Promise<NodeTokenResponse> {
-
-        const access_token = await this._auth.requestAccessToken(authorizationCode, sessionState);
-        const sub_from_token = await this._auth.getDecodedIDToken();
-
-        if (!(access_token && sub_from_token)) {
-            return Promise.reject(
-                new AsgardeoAuthException(
-                    "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                    "node-authentication",
-                    "requestAccessToken",
-                    "Access token or decoded token failed.",
-                    "No token endpoint was found in the OIDC provider meta data returned by the well-known endpoint " +
-                    "or the token endpoint passed to the SDK is empty."
-                )
-            )
-        }
-
-        //Create a UUID and check if the user has a session already
-        const user_uuid = await this._sessionStore.getUUID(sub_from_token.sub);
-        const existing_user = await this._sessionStore.getUserSession(user_uuid);
-
-        //Declare the response type
-        let response: NodeTokenResponse = { ...access_token, session: "" };
-
-        if (Object.keys(existing_user).length === 0) {
-            //Create a new session if the user does not have one already
-            const new_user_session = await this._sessionStore.createUserSession(sub_from_token.sub, access_token)
-            response = { ...access_token, session: new_user_session };
-        } else {
-            response = { ...access_token, session: user_uuid };
-        }
-
-        return Promise.resolve(response);
-
-    }
-
-    public async getIDToken(uuid: string): Promise<string> {
-
-        const user_session = await this._sessionStore.getUserSession(uuid);
-        if (Object.keys(user_session).length === 0) {
-            return Promise.reject(
-                new AsgardeoAuthException(
-                    "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                    "node-authentication",
-                    "getIDToken",
-                    "The user is not logged in.",
-                    "No token endpoint was found in the OIDC provider meta data returned by the well-known endpoint " +
-                    "or the token endpoint passed to the SDK is empty."
-                )
-            )
-        }
-        const idToken = await this._auth.getIDToken();
-        if (idToken) {
-            return Promise.resolve(idToken)
-        } else {
-            return Promise.reject(
-                new AsgardeoAuthException(
-                    "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                    "node-authentication",
-                    "getIDToken",
-                    "Requesting ID Token Failed",
-                    "No token endpoint was found in the OIDC provider meta data returned by the well-known endpoint " +
-                    "or the token endpoint passed to the SDK is empty."
-                )
-            )
-        }
-    }
-
-    public async isAuthenticated(uuid: string): Promise<boolean> {
-        try {
-            const existing_user_session = await this._sessionStore.getUserSession(uuid);
-            const isServerAuthenticated = Object.keys(existing_user_session).length === 0 ? false : true;
-
-            const isAsgardeoAuthenticated = await this._auth.isAuthenticated();
-
-            if (isAsgardeoAuthenticated && isServerAuthenticated) {
-                return Promise.resolve(true);
-            } else {
-                return Promise.resolve(false);
-            }
-        } catch (error) {
-            return Promise.reject(
-                new AsgardeoAuthException(
-                    "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                    "node-authentication",
-                    "isAuthenticated",
-                    "Requesting ID Token Failed",
-                    "No token endpoint was found in the OIDC provider meta data returned by the well-known endpoint " +
-                    "or the token endpoint passed to the SDK is empty."
+                    "NODE-AUTH_CORE-GAU-NF01",
+                    "Getting Authorization URL failed.",
+                    "No authorization URL was returned by the Asgardeo Auth JS SDK."
                 )
             );
         }
     }
 
-    public async signOut(uuid: string): Promise<string> {
+    public async requestAccessToken(
+        authorizationCode: string,
+        sessionState: string,
+        userId: string,
+        state: string
+    ): Promise<TokenResponse> {
+        return this._auth.requestAccessToken(authorizationCode, sessionState, state, userId);
+    }
 
-        const signOutURL = await this._auth.getSignOutURL();
-        const destroySession = await this._sessionStore.destroyUserSession(uuid);
-
-        if (!signOutURL || !destroySession) {
+    public async getIDToken(userId: string): Promise<string> {
+        const is_logged_in = await this.isAuthenticated(userId);
+        if (!is_logged_in) {
             return Promise.reject(
                 new AsgardeoAuthException(
-                    "AUTH_CORE-RAT1-NF01", //TODO: Not sure
-                    "node-authentication",
-                    "signout",
-                    "Signing out the user failed.",
-                    "Could not obtain the signout URL from the server."
+                    "NODE-AUTH_CORE-GIT-NF01",
+                    "The user is not logged in.",
+                    "No session ID was found for the requested user. User is not logged in."
                 )
-            )
+            );
+        }
+        const idToken = await this._auth.getIDToken(userId);
+        if (idToken) {
+            return Promise.resolve(idToken);
+        } else {
+            return Promise.reject(
+                new AsgardeoAuthException(
+                    "NODE-AUTH_CORE-GIT-NF02",
+                    "Requesting ID Token Failed",
+                    "No ID Token was returned by the Asgardeo Auth JS SDK."
+                )
+            );
+        }
+    }
+
+    public async refreshAccessToken(userId: string): Promise<TokenResponse> {
+        return this._auth.refreshAccessToken(userId);
+    }
+
+    public async isAuthenticated(userId: string): Promise<boolean> {
+        try {
+            if (!(await this._auth.isAuthenticated(userId))) {
+                return Promise.resolve(false);
+            }
+
+            if (await SessionUtils.validateSession(await this._dataLayer.getSessionData(userId))) {
+                return Promise.resolve(true);
+            }
+
+            const refreshed_token = await this.refreshAccessToken(userId);
+
+            if (refreshed_token) {
+                return Promise.resolve(true);
+            }
+
+            this._dataLayer.removeSessionData(userId);
+            this._dataLayer.getTemporaryData(userId);
+            return Promise.resolve(false);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    }
+
+    public async signOut(userId: string): Promise<string> {
+        const signOutURL = await this._auth.getSignOutURL(userId);
+
+        if (!signOutURL) {
+            return Promise.reject(
+                new AsgardeoAuthException(
+                    "NODE-AUTH_CORE-SO-NF01",
+                    "Signing out the user failed.",
+                    "Could not obtain the sign-out URL from the server."
+                )
+            );
         }
 
         return Promise.resolve(signOutURL);
     }
 
+    public async getBasicUserInfo(userId: string): Promise<BasicUserInfo> {
+        return this._auth.getBasicUserInfo(userId);
+    }
+
+    public async getOIDCServiceEndpoints(): Promise<OIDCEndpoints>{
+        return this._auth.getOIDCServiceEndpoints();
+    }
+
+    public async getDecodedIDToken(userId?: string): Promise<DecodedIDTokenPayload>{
+        return this._auth.getDecodedIDToken(userId);
+    }
+
+    public async getAccessToken(userId?: string): Promise<string>{
+        return this._auth.getAccessToken(userId);
+    }
+
+    public async requestCustomGrant(config: CustomGrantConfig, userId?: string): Promise<TokenResponse | FetchResponse>{
+        return this._auth.requestCustomGrant(config, userId);
+    }
+
+    public async getPKCECode(state: string, userId?: string): Promise<string>{
+        return this._auth.getPKCECode(state, userId);
+    }
+
+    public async setPKCECode(pkce: string, state: string, userId?: string): Promise<void>{
+        return this._auth.setPKCECode(pkce, state, userId);
+    }
+
+    public async updateConfig(config: Partial<AuthClientConfig<T>>): Promise<void>{
+        return this._auth.updateConfig(config);
+    }
+
+    public async revokeAccessToken(userId?: string): Promise<FetchResponse>{
+        return this._auth.revokeAccessToken(userId);
+    }
+
+    public static didSignOutFail(signOutRedirectURL: string): boolean{
+        return AsgardeoNodeCore.didSignOutFail(signOutRedirectURL);
+    }
+
+    public static isSignOutSuccessful(signOutRedirectURL: string): boolean{
+        return AsgardeoNodeCore.isSignOutSuccessful(signOutRedirectURL);
+    } 
+    
 }
